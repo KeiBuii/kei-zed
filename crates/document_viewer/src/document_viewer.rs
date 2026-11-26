@@ -1,7 +1,8 @@
 mod document;
+mod page_cache;
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
@@ -9,10 +10,11 @@ use anyhow::{Context as _, Result};
 use binary_file_item::{BinaryFileItem, BinaryFileItemEvent, FileFormat, LoadState};
 use file_icons::FileIcons;
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Image, ImageFormat,
-    ListAlignment, ListOffset, ListState, Render, Subscription, Task, WeakEntity, Window, actions,
-    img, list,
+    AnyElement, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Image,
+    ImageFormat, ListAlignment, ListOffset, ListState, Render, Subscription, Task, WeakEntity,
+    Window, actions, img, list,
 };
+use page_cache::{CachedPage, PageCache, PageKey};
 use persistence::DocumentViewerDb;
 use project::Project;
 use settings::Settings as _;
@@ -49,8 +51,6 @@ const ZOOM_STEP: f32 = 1.25;
 const RENDER_SCALE_STEP: f32 = 0.25;
 /// Rendering a page much larger than this costs a lot of memory for little visible gain.
 const MAX_RENDER_SCALE: f32 = 6.0;
-/// Rendered pages kept in memory. Pages scrolled out of view beyond this are rendered again.
-const MAX_CACHED_PAGES: usize = 16;
 const PAGE_GAP: f32 = 16.0;
 
 pub fn init(cx: &mut App) {
@@ -72,29 +72,24 @@ impl FileFormat for WordFormat {
 
 pub type DocumentItem = BinaryFileItem<WordFormat>;
 
-struct RenderedPage {
-    scale: f32,
-    image: Arc<Image>,
-}
-
 pub enum DocumentViewEvent {
     TitleChanged,
 }
 
 /// A read-only tab that shows a Word document page by page, like a word processor does. Only the
-/// pages near the visible area are rendered, on a background thread, and kept in a small cache.
+/// pages near the visible area are rendered, on a background thread, and kept in a [`PageCache`]
+/// shared with the other document views.
 pub struct DocumentView {
+    /// Identifies this view's pages in the [`PageCache`].
+    view_id: EntityId,
     item: Entity<DocumentItem>,
     project: Entity<Project>,
     focus_handle: FocusHandle,
-    /// The document whose pages are in `list_state` and `rendered_pages`. Compared with the
+    /// The document whose pages are in `list_state` and the page cache. Compared with the
     /// item's document to tell a reload apart from other item notifications.
     shown_document: Option<Arc<WordDocument>>,
     list_state: ListState,
     zoom: f32,
-    rendered_pages: HashMap<usize, RenderedPage>,
-    /// Most recently shown pages last, used to evict pages from `rendered_pages`.
-    page_use_order: VecDeque<usize>,
     pending_renders: HashMap<usize, (f32, Task<()>)>,
     failed_pages: HashSet<usize>,
     current_page: usize,
@@ -133,14 +128,13 @@ impl DocumentView {
         ];
 
         let mut this = Self {
+            view_id: cx.entity_id(),
             item,
             project,
             focus_handle: cx.focus_handle(),
             shown_document: None,
             list_state,
             zoom: 1.0,
-            rendered_pages: HashMap::default(),
-            page_use_order: VecDeque::new(),
             pending_renders: HashMap::default(),
             failed_pages: HashSet::default(),
             current_page: 0,
@@ -164,8 +158,9 @@ impl DocumentView {
             .map_or(0, |document| document.pages().len())
     }
 
-    pub fn rendered_page_count(&self) -> usize {
-        self.rendered_pages.len()
+    pub fn rendered_page_count(&self, cx: &App) -> usize {
+        cx.try_global::<PageCache>()
+            .map_or(0, |cache| cache.page_count(self.view_id))
     }
 
     fn sync_with_item(&mut self, cx: &mut Context<Self>) {
@@ -194,10 +189,8 @@ impl DocumentView {
     }
 
     fn clear_rendered_pages(&mut self, cx: &mut App) {
-        for (_, page) in self.rendered_pages.drain() {
-            page.image.remove_asset(cx);
-        }
-        self.page_use_order.clear();
+        let removed = cx.default_global::<PageCache>().remove_view(self.view_id);
+        release_images(removed, cx);
         self.pending_renders.clear();
         self.failed_pages.clear();
     }
@@ -253,23 +246,22 @@ impl DocumentView {
             .clamp(RENDER_SCALE_STEP, MAX_RENDER_SCALE)
     }
 
-    fn mark_page_used(&mut self, page_index: usize, cx: &mut App) {
-        self.page_use_order.retain(|&used| used != page_index);
-        self.page_use_order.push_back(page_index);
-        while self.page_use_order.len() > MAX_CACHED_PAGES {
-            if let Some(evicted) = self.page_use_order.pop_front()
-                && let Some(page) = self.rendered_pages.remove(&evicted)
-            {
-                page.image.remove_asset(cx);
-            }
+    fn page_key(&self, page_index: usize) -> PageKey {
+        PageKey {
+            view: self.view_id,
+            page_index,
         }
     }
 
-    fn request_page_render(&mut self, page_index: usize, scale: f32, cx: &mut Context<Self>) {
-        let is_up_to_date = self
-            .rendered_pages
-            .get(&page_index)
-            .is_some_and(|page| page.scale == scale);
+    fn request_page_render(
+        &mut self,
+        page_index: usize,
+        page: PageSize,
+        scale: f32,
+        rendered_scale: Option<f32>,
+        cx: &mut Context<Self>,
+    ) {
+        let is_up_to_date = rendered_scale == Some(scale);
         let is_pending = self
             .pending_renders
             .get(&page_index)
@@ -290,13 +282,12 @@ impl DocumentView {
                 match png {
                     Ok(png) => {
                         let image = Arc::new(Image::from_bytes(ImageFormat::Png, png));
-                        if let Some(replaced) = this
-                            .rendered_pages
-                            .insert(page_index, RenderedPage { scale, image })
-                        {
-                            replaced.image.remove_asset(cx);
-                        }
-                        this.mark_page_used(page_index, cx);
+                        let page =
+                            CachedPage::new(scale, image, page.width * scale, page.height * scale);
+                        let removed = cx
+                            .default_global::<PageCache>()
+                            .insert(this.page_key(page_index), page);
+                        release_images(removed, cx);
                     }
                     Err(error) => {
                         log::error!("{error:#}");
@@ -325,15 +316,16 @@ impl DocumentView {
         };
 
         let scale = self.render_scale(window);
-        self.request_page_render(page_index, scale, cx);
-        if self.rendered_pages.contains_key(&page_index) {
-            self.mark_page_used(page_index, cx);
-        }
+        let rendered = cx
+            .default_global::<PageCache>()
+            .use_page(self.page_key(page_index));
+        let rendered_scale = rendered.as_ref().map(|rendered| rendered.scale);
+        self.request_page_render(page_index, page, scale, rendered_scale, cx);
 
         // While a page renders at a new zoom level, the previous render is stretched to fit, so
         // zooming does not flash blank pages.
-        let content = if let Some(rendered) = self.rendered_pages.get(&page_index) {
-            img(rendered.image.clone()).size_full().into_any_element()
+        let content = if let Some(rendered) = rendered {
+            img(rendered.image).size_full().into_any_element()
         } else if self.failed_pages.contains(&page_index) {
             h_flex()
                 .size_full()
@@ -451,6 +443,12 @@ impl DocumentView {
     }
 }
 
+fn release_images(images: Vec<Arc<Image>>, cx: &mut App) {
+    for image in images {
+        image.remove_asset(cx);
+    }
+}
+
 fn render_message(message: SharedString, color: Color) -> AnyElement {
     h_flex()
         .size_full()
@@ -523,6 +521,12 @@ impl Item for DocumentView {
             .color(params.text_color())
             .when(params.preview, |label| label.italic())
             .into_any_element()
+    }
+
+    /// A hidden tab gives its rendered pages back to the other documents, and renders the visible
+    /// pages again once it is shown.
+    fn deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_rendered_pages(cx);
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
@@ -795,9 +799,54 @@ mod tests {
                 cx.update(|window, _| window.refresh());
                 cx.run_until_parked();
             }
-            view.read_with(cx, |view, _| {
-                assert!(view.rendered_page_count() >= 1);
+            view.read_with(cx, |view, cx| {
+                assert!(view.rendered_page_count(cx) >= 1);
             });
+            Ok(())
+        }
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[gpui::test]
+    async fn test_hidden_tabs_free_their_pages(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({})).await;
+        fs.insert_file(path!("/project/report.docx"), SAMPLE_DOCX.to_vec())
+            .await;
+        fs.insert_file(path!("/project/legacy.doc"), SAMPLE_DOC.to_vec())
+            .await;
+        let (workspace, cx) = test_workspace(fs, cx).await;
+
+        let render_until_parked = |cx: &mut VisualTestContext| {
+            for _ in 0..3 {
+                cx.update(|window, _| window.refresh());
+                cx.run_until_parked();
+            }
+        };
+
+        let result: Result<()> = async {
+            let report = open_document(path!("/project/report.docx"), &workspace, cx).await?;
+            render_until_parked(cx);
+            assert!(report.read_with(cx, |view, cx| view.rendered_page_count(cx)) >= 1);
+
+            let legacy = open_document(path!("/project/legacy.doc"), &workspace, cx).await?;
+            render_until_parked(cx);
+            assert_eq!(
+                report.read_with(cx, |view, cx| view.rendered_page_count(cx)),
+                0
+            );
+            assert!(legacy.read_with(cx, |view, cx| view.rendered_page_count(cx)) >= 1);
+
+            // Showing the tab again renders its visible pages again.
+            open_document(path!("/project/report.docx"), &workspace, cx).await?;
+            render_until_parked(cx);
+            assert!(report.read_with(cx, |view, cx| view.rendered_page_count(cx)) >= 1);
+            assert_eq!(
+                legacy.read_with(cx, |view, cx| view.rendered_page_count(cx)),
+                0
+            );
             Ok(())
         }
         .await;
