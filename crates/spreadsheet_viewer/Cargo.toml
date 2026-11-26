@@ -14,6 +14,7 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+binary_file_item.workspace = true
 calamine.workspace = true
 db.workspace = true
 file_icons.workspace = true
@@ -25,7 +26,6 @@ tabular_data_preview.workspace = true
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true
-worktree.workspace = true
 
 [dev-dependencies]
 editor = { workspace = true, features = ["test-support"] }

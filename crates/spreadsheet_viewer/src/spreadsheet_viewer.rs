@@ -1,15 +1,16 @@
 mod workbook;
 
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
+use binary_file_item::{BinaryFileItem, BinaryFileItemEvent, FileFormat, LoadState};
 use file_icons::FileIcons;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, Subscription,
     Task, WeakEntity, Window,
 };
 use persistence::SpreadsheetViewerDb;
-use project::{MTime, Project, ProjectEntryId, ProjectPath, UpdatedEntriesSet, Worktree};
+use project::Project;
 use settings::Settings as _;
 use tabular_data_preview::TableView;
 use ui::{ButtonStyle, prelude::*};
@@ -21,223 +22,24 @@ use workspace::{
 
 pub use crate::workbook::{Sheet, Workbook, column_name, parse_workbook};
 
-const SPREADSHEET_EXTENSIONS: &[&str] = &["xlsx", "xlsm", "xls", "ods"];
-
 pub fn init(cx: &mut App) {
     workspace::register_project_item::<SpreadsheetView>(cx);
     workspace::register_serializable_item::<SpreadsheetView>(cx);
 }
 
-fn is_spreadsheet_extension(extension: &str) -> bool {
-    SPREADSHEET_EXTENSIONS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(extension))
-}
+pub struct SpreadsheetFormat;
 
-#[derive(Clone)]
-pub enum LoadState {
-    Loading,
-    Loaded(Arc<Workbook>),
-    Failed(SharedString),
-}
+impl FileFormat for SpreadsheetFormat {
+    type Content = Workbook;
+    const EXTENSIONS: &'static [&'static str] = &["xlsx", "xlsm", "xls", "ods"];
+    const DISPLAY_NAME: &'static str = "Spreadsheet";
 
-pub enum SpreadsheetItemEvent {
-    /// The workbook finished loading, or failed to load.
-    ContentChanged,
-    /// The file was renamed, deleted or restored.
-    FileChanged,
-}
-
-/// A spreadsheet file in a local worktree. It is read in the background and read again whenever
-/// the worktree reports that the file changed on disk.
-pub struct SpreadsheetItem {
-    worktree: Entity<Worktree>,
-    project_path: ProjectPath,
-    entry_id: Option<ProjectEntryId>,
-    loaded_mtime: Option<MTime>,
-    state: LoadState,
-    is_deleted: bool,
-    load_task: Option<Task<()>>,
-    _worktree_subscription: Subscription,
-}
-
-impl EventEmitter<SpreadsheetItemEvent> for SpreadsheetItem {}
-
-impl SpreadsheetItem {
-    fn new(worktree: Entity<Worktree>, project_path: ProjectPath, cx: &mut Context<Self>) -> Self {
-        let entry_id = worktree
-            .read(cx)
-            .entry_for_path(&project_path.path)
-            .map(|entry| entry.id);
-        let worktree_subscription =
-            cx.subscribe(&worktree, |this, worktree, event, cx| match event {
-                worktree::Event::UpdatedEntries(changes) => {
-                    this.worktree_entries_changed(&worktree, changes, cx);
-                }
-                worktree::Event::DeletedEntry(entry_id) if Some(*entry_id) == this.entry_id => {
-                    this.set_deleted(true, cx);
-                }
-                worktree::Event::Deleted => this.set_deleted(true, cx),
-                _ => {}
-            });
-
-        let mut this = Self {
-            worktree,
-            project_path,
-            entry_id,
-            loaded_mtime: None,
-            state: LoadState::Loading,
-            is_deleted: false,
-            load_task: None,
-            _worktree_subscription: worktree_subscription,
-        };
-        this.reload(cx);
-        this
-    }
-
-    pub fn state(&self) -> &LoadState {
-        &self.state
-    }
-
-    pub fn abs_path(&self, cx: &App) -> PathBuf {
-        self.worktree.read(cx).absolutize(&self.project_path.path)
-    }
-
-    fn file_name(&self, cx: &App) -> SharedString {
-        // Files opened on their own get a single-file worktree whose relative path is empty, so
-        // the name has to come from the absolute path.
-        self.abs_path(cx)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned().into())
-            .unwrap_or_else(|| "Spreadsheet".into())
-    }
-
-    fn worktree_entries_changed(
-        &mut self,
-        worktree: &Entity<Worktree>,
-        changes: &UpdatedEntriesSet,
-        cx: &mut Context<Self>,
-    ) {
-        let is_relevant = changes.iter().any(|(path, entry_id, _)| {
-            Some(*entry_id) == self.entry_id || *path == self.project_path.path
-        });
-        if !is_relevant {
-            return;
-        }
-
-        // Saving through a temporary file and a rename gives the file a new entry id, so fall
-        // back to looking the entry up by path.
-        let snapshot = worktree.read(cx);
-        let entry = self
-            .entry_id
-            .and_then(|entry_id| snapshot.entry_for_id(entry_id))
-            .or_else(|| snapshot.entry_for_path(&self.project_path.path))
-            .map(|entry| (entry.id, entry.path.clone(), entry.mtime));
-
-        let Some((entry_id, path, mtime)) = entry else {
-            self.set_deleted(true, cx);
-            return;
-        };
-
-        self.entry_id = Some(entry_id);
-        if path != self.project_path.path {
-            self.project_path.path = path;
-            cx.emit(SpreadsheetItemEvent::FileChanged);
-        }
-        self.set_deleted(false, cx);
-        if mtime != self.loaded_mtime {
-            self.reload(cx);
-        }
-    }
-
-    fn set_deleted(&mut self, is_deleted: bool, cx: &mut Context<Self>) {
-        if self.is_deleted != is_deleted {
-            self.is_deleted = is_deleted;
-            cx.emit(SpreadsheetItemEvent::FileChanged);
-            cx.notify();
-        }
-    }
-
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        let load_file = self.worktree.update(cx, |worktree, cx| {
-            worktree.load_binary_file(&self.project_path.path, cx)
-        });
-        self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = async {
-                let loaded_file = load_file.await?;
-                let mtime = loaded_file.file.disk_state.mtime();
-                let content = loaded_file.content;
-                let workbook = cx
-                    .background_spawn(async move { parse_workbook(&content) })
-                    .await?;
-                anyhow::Ok((mtime, workbook))
-            }
-            .await;
-
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok((mtime, workbook)) => {
-                        this.loaded_mtime = mtime;
-                        this.state = LoadState::Loaded(Arc::new(workbook));
-                    }
-                    Err(error) => {
-                        log::error!("Failed to load spreadsheet: {error:#}");
-                        this.state = LoadState::Failed(format!("{error:#}").into());
-                    }
-                }
-                cx.emit(SpreadsheetItemEvent::ContentChanged);
-                cx.notify();
-            })
-            .log_err();
-        }));
+    fn parse(bytes: &[u8]) -> Result<Workbook> {
+        parse_workbook(bytes)
     }
 }
 
-impl project::ProjectItem for SpreadsheetItem {
-    fn try_open(
-        project: &Entity<Project>,
-        path: &ProjectPath,
-        cx: &mut App,
-    ) -> Option<Task<Result<Entity<Self>>>> {
-        // For single-file worktrees the relative path is empty, so fall back to the absolute path
-        // to detect spreadsheets opened directly.
-        let is_spreadsheet = path.path.extension().is_some_and(is_spreadsheet_extension)
-            || project
-                .read(cx)
-                .absolute_path(path, cx)
-                .as_deref()
-                .and_then(|abs_path| abs_path.extension())
-                .and_then(|extension| extension.to_str())
-                .is_some_and(is_spreadsheet_extension);
-        if !is_spreadsheet {
-            return None;
-        }
-
-        let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx);
-        let path = path.clone();
-        Some(cx.spawn(async move |cx| {
-            let worktree = worktree.context("Worktree not found")?;
-            let is_local = worktree.read_with(cx, |worktree, _| worktree.is_local());
-            anyhow::ensure!(
-                is_local,
-                "Spreadsheets can only be viewed in local projects"
-            );
-            Ok(cx.new(|cx| SpreadsheetItem::new(worktree, path, cx)))
-        }))
-    }
-
-    fn entry_id(&self, _: &App) -> Option<ProjectEntryId> {
-        self.entry_id
-    }
-
-    fn project_path(&self, _: &App) -> Option<ProjectPath> {
-        Some(self.project_path.clone())
-    }
-
-    fn is_dirty(&self) -> bool {
-        false
-    }
-}
+pub type SpreadsheetItem = BinaryFileItem<SpreadsheetFormat>;
 
 pub enum SpreadsheetViewEvent {
     TitleChanged,
@@ -269,8 +71,8 @@ impl SpreadsheetView {
         let table = cx.new(|cx| TableView::new(window, cx));
         let subscriptions = vec![
             cx.subscribe(&item, |this, _, event, cx| match event {
-                SpreadsheetItemEvent::ContentChanged => this.sync_with_item(cx),
-                SpreadsheetItemEvent::FileChanged => cx.emit(SpreadsheetViewEvent::TitleChanged),
+                BinaryFileItemEvent::ContentChanged => this.sync_with_item(cx),
+                BinaryFileItemEvent::FileChanged => cx.emit(SpreadsheetViewEvent::TitleChanged),
             }),
             cx.observe(&table, |_, _, cx| cx.notify()),
         ];
@@ -301,7 +103,7 @@ impl SpreadsheetView {
     }
 
     fn sync_with_item(&mut self, cx: &mut Context<Self>) {
-        match self.item.read(cx).state.clone() {
+        match self.item.read(cx).state().clone() {
             LoadState::Loading => {
                 self.table
                     .update(cx, |table, cx| table.set_loading(true, cx));
@@ -505,7 +307,7 @@ impl Item for SpreadsheetView {
     }
 
     fn has_deleted_file(&self, cx: &App) -> bool {
-        self.item.read(cx).is_deleted
+        self.item.read(cx).is_deleted()
     }
 
     fn buffer_kind(&self, _: &App) -> ItemBufferKind {
@@ -546,22 +348,7 @@ impl SerializableItem for SpreadsheetView {
                 .get_spreadsheet_path(item_id, workspace_id)?
                 .context("No spreadsheet path found")?;
 
-            let (worktree, relative_path) = project
-                .update(cx, |project, cx| {
-                    project.find_or_create_worktree(abs_path, false, cx)
-                })
-                .await
-                .context("Path not found")?;
-            let project_path = ProjectPath {
-                worktree_id: worktree.read_with(cx, |worktree, _| worktree.id()),
-                path: relative_path,
-            };
-
-            let open_item = cx.update(|_, cx| {
-                <SpreadsheetItem as project::ProjectItem>::try_open(&project, &project_path, cx)
-            })?;
-            let item = open_item.context("Not a spreadsheet file")?.await?;
-
+            let item = SpreadsheetItem::open_abs_path(project.clone(), abs_path, cx).await?;
             cx.update(|window, cx| cx.new(|cx| SpreadsheetView::new(item, project, window, cx)))
         })
     }
@@ -656,7 +443,7 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
     use project::FakeFs;
     use serde_json::json;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use util::path;
     use workspace::{AppState, OpenOptions};
 
