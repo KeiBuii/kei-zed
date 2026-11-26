@@ -205,6 +205,7 @@ members = [
     "crates/snippet",
     "crates/snippet_provider",
     "crates/snippets_ui",
+    "crates/spreadsheet_viewer",
     "crates/sqlez",
     "crates/sqlez_macros",
     "crates/streaming_diff",
@@ -483,6 +484,7 @@ sidebar = { path = "crates/sidebar" }
 snippet = { path = "crates/snippet" }
 snippet_provider = { path = "crates/snippet_provider" }
 snippets_ui = { path = "crates/snippets_ui" }
+spreadsheet_viewer = { path = "crates/spreadsheet_viewer" }
 sqlez = { path = "crates/sqlez" }
 sqlez_macros = { path = "crates/sqlez_macros" }
 streaming_diff = { path = "crates/streaming_diff" }
@@ -600,6 +602,7 @@ block2 = "0.6"
 brush-parser = "0.3"
 bytemuck = "1"
 bytes = "1.0"
+calamine = { version = "0.38", default-features = false }
 cargo_metadata = "0.23"
 cargo_toml = "0.21"
 cbindgen = { version = "0.28.0", default-features = false }

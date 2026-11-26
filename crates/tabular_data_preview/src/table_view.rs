@@ -173,6 +173,11 @@ impl TableView {
         self.apply_filter_sort(cx);
     }
 
+    /// The data currently shown by the grid, before filtering and sorting.
+    pub fn contents(&self) -> &TableLikeContent {
+        &self.engine.contents
+    }
+
     /// Toggle the loading indicator (shown while a producer computes new content).
     pub fn set_loading(&mut self, is_loading: bool, cx: &mut Context<Self>) {
         self.is_loading = is_loading;
