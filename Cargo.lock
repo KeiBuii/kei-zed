@@ -5231,8 +5231,19 @@ name = "document_viewer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "binary_file_item",
+ "editor",
+ "file_icons",
+ "gpui",
+ "log",
+ "project",
  "rdocx",
  "rwml",
+ "serde_json",
+ "settings",
+ "ui",
+ "util",
+ "workspace",
 ]
 
 [[package]]

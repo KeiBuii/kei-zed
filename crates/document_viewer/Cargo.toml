@@ -14,5 +14,21 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+binary_file_item.workspace = true
+file_icons.workspace = true
+gpui.workspace = true
+log.workspace = true
+project.workspace = true
 rdocx.workspace = true
 rwml.workspace = true
+settings.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+editor = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+workspace = { workspace = true, features = ["test-support"] }
