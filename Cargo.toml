@@ -58,6 +58,7 @@ members = [
     "crates/dev_container",
     "crates/diagnostics",
     "crates/docs_preprocessor",
+    "crates/document_viewer",
     "crates/edit_prediction",
     "crates/edit_prediction_cli",
     "crates/edit_prediction_context",
@@ -346,6 +347,7 @@ deepseek = { path = "crates/deepseek" }
 derive_refineable = { path = "crates/refineable/derive_refineable" }
 dev_container = { path = "crates/dev_container" }
 diagnostics = { path = "crates/diagnostics" }
+document_viewer = { path = "crates/document_viewer" }
 edit_prediction = { path = "crates/edit_prediction" }
 edit_prediction_context = { path = "crates/edit_prediction_context" }
 edit_prediction_metrics = { path = "crates/edit_prediction_metrics", features = ["tree-sitter"] }
@@ -880,6 +882,7 @@ quote = "1.0.9"
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"] }
 raw-window-handle = "0.6"
 rayon = "1.8"
+rdocx = { version = "0.17", default-features = false }
 regex = { version = "1.5", default-features = false, features = ["std", "perf"] }
 # WARNING: If you change this, you must also publish a new version of zed-reqwest to crates.io
 reqwest = { git = "https://github.com/zed-industries/reqwest.git", rev = "33bc764aa15ff7b200bf7c93bd96e24878d53e14", default-features = false, features = [
@@ -905,6 +908,7 @@ rustix = { version = "1.1", features = ["fs"] }
 rustls = "0.23.26"
 rustls-platform-verifier = "0.7"
 # WARNING: If you change this, you must also publish a new version of zed-scap to crates.io
+rwml = { version = "0.1", default-features = false, features = ["docx"] }
 scap = { git = "https://github.com/zed-industries/scap", rev = "b5c86ec58dd4b6b7732bf6ac8be03d6b1f190a82", default-features = false, package = "zed-scap", version = "0.0.8-zed" }
 schemars = { version = "1.0", default-features = false, features = ["std", "indexmap2"] }
 sea-orm = { version = "=1.1.10", default-features = false }
