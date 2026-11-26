@@ -15,6 +15,7 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 binary_file_item.workspace = true
+db.workspace = true
 file_icons.workspace = true
 gpui.workspace = true
 log.workspace = true

@@ -5232,6 +5232,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "binary_file_item",
+ "db",
  "editor",
  "file_icons",
  "gpui",
@@ -23233,6 +23234,7 @@ dependencies = [
  "debugger_ui",
  "dev_container",
  "diagnostics",
+ "document_viewer",
  "edit_prediction",
  "edit_prediction_ui",
  "editor",

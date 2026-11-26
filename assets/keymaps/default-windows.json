@@ -1620,6 +1620,16 @@
     },
   },
   {
+    "context": "DocumentViewer",
+    "bindings": {
+      "ctrl-=": "document_viewer::ZoomIn",
+      "ctrl-+": "document_viewer::ZoomIn",
+      "ctrl--": "document_viewer::ZoomOut",
+      "ctrl-0": "document_viewer::ResetZoom",
+      "ctrl-shift-0": "document_viewer::FitWidth",
+    },
+  },
+  {
     "context": "RunModal",
     "bindings": {
       "alt-1": "new_process_modal::ActivateTaskTab",

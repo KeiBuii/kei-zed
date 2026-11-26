@@ -5,20 +5,22 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use binary_file_item::{BinaryFileItem, BinaryFileItemEvent, FileFormat, LoadState};
 use file_icons::FileIcons;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Image, ImageFormat,
-    ListAlignment, ListOffset, ListState, Render, Subscription, Task, Window, actions, img, list,
+    ListAlignment, ListOffset, ListState, Render, Subscription, Task, WeakEntity, Window, actions,
+    img, list,
 };
+use persistence::DocumentViewerDb;
 use project::Project;
 use settings::Settings as _;
 use ui::{IconButtonShape, Tooltip, prelude::*};
 use util::{ResultExt as _, paths::PathExt as _};
 use workspace::{
-    ItemSettings, Pane, WorkspaceId,
-    item::{Item, ItemBufferKind, ItemEvent, ProjectItem, TabContentParams},
+    ItemId, ItemSettings, Pane, Workspace, WorkspaceId, delete_unloaded_items,
+    item::{Item, ItemBufferKind, ItemEvent, ProjectItem, SerializableItem, TabContentParams},
 };
 
 pub use crate::document::{PageSize, WordDocument};
@@ -53,6 +55,7 @@ const PAGE_GAP: f32 = 16.0;
 
 pub fn init(cx: &mut App) {
     workspace::register_project_item::<DocumentView>(cx);
+    workspace::register_serializable_item::<DocumentView>(cx);
 }
 
 pub struct WordFormat;
@@ -583,10 +586,115 @@ impl ProjectItem for DocumentView {
     }
 }
 
+impl SerializableItem for DocumentView {
+    fn serialized_item_kind() -> &'static str {
+        "DocumentView"
+    }
+
+    fn deserialize(
+        project: Entity<Project>,
+        _workspace: WeakEntity<Workspace>,
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        let db = DocumentViewerDb::global(cx);
+        window.spawn(cx, async move |cx| {
+            let abs_path = db
+                .get_document_path(item_id, workspace_id)?
+                .context("No document path found")?;
+            let item = DocumentItem::open_abs_path(project.clone(), abs_path, cx).await?;
+            cx.update(|window, cx| cx.new(|cx| DocumentView::new(item, project, window, cx)))
+        })
+    }
+
+    fn cleanup(
+        workspace_id: WorkspaceId,
+        alive_items: Vec<ItemId>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let db = DocumentViewerDb::global(cx);
+        delete_unloaded_items(alive_items, workspace_id, "document_viewers", &db, cx)
+    }
+
+    fn serialize(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: ItemId,
+        _closing: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        let workspace_id = workspace.database_id()?;
+        let abs_path = self.item.read(cx).abs_path(cx);
+        let db = DocumentViewerDb::global(cx);
+        Some(cx.background_spawn(async move {
+            db.save_document_path(item_id, workspace_id, abs_path).await
+        }))
+    }
+
+    fn should_serialize(&self, _event: &Self::Event) -> bool {
+        false
+    }
+}
+
+mod persistence {
+    use std::path::PathBuf;
+
+    use db::{
+        query,
+        sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
+        sqlez_macros::sql,
+    };
+    use workspace::{ItemId, WorkspaceDb, WorkspaceId};
+
+    pub struct DocumentViewerDb(ThreadSafeConnection);
+
+    impl Domain for DocumentViewerDb {
+        const NAME: &str = stringify!(DocumentViewerDb);
+
+        const MIGRATIONS: &[&str] = &[sql!(
+                CREATE TABLE document_viewers (
+                    workspace_id INTEGER,
+                    item_id INTEGER UNIQUE,
+
+                    document_path BLOB,
+
+                    PRIMARY KEY(workspace_id, item_id),
+                    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                    ON DELETE CASCADE
+                ) STRICT;
+        )];
+    }
+
+    db::static_connection!(DocumentViewerDb, [WorkspaceDb]);
+
+    impl DocumentViewerDb {
+        query! {
+            pub async fn save_document_path(
+                item_id: ItemId,
+                workspace_id: WorkspaceId,
+                document_path: PathBuf
+            ) -> Result<()> {
+                INSERT OR REPLACE INTO document_viewers(item_id, workspace_id, document_path)
+                VALUES (?, ?, ?)
+            }
+        }
+
+        query! {
+            pub fn get_document_path(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<PathBuf>> {
+                SELECT document_path
+                FROM document_viewers
+                WHERE item_id = ? AND workspace_id = ?
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Context as _;
     use gpui::{TestAppContext, VisualTestContext};
     use project::FakeFs;
     use serde_json::json;

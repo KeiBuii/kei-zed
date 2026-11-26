@@ -1697,6 +1697,17 @@
     },
   },
   {
+    "context": "DocumentViewer",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-=": "document_viewer::ZoomIn",
+      "cmd-+": "document_viewer::ZoomIn",
+      "cmd--": "document_viewer::ZoomOut",
+      "cmd-0": "document_viewer::ResetZoom",
+      "cmd-shift-0": "document_viewer::FitWidth",
+    },
+  },
+  {
     "context": "RunModal",
     "bindings": {
       "cmd-1": "new_process_modal::ActivateTaskTab",
