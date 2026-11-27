@@ -5,6 +5,8 @@ use std::{
 
 use gpui::{EntityId, Global, Image};
 
+use crate::document::PageColors;
+
 /// Memory that rendered pages of all open documents may use together. A rendered page is kept
 /// decoded as 4 bytes per pixel, so an A4 page at 100% zoom on a Retina display takes about
 /// 14 MB, and four times that at 200%.
@@ -23,16 +25,18 @@ pub struct PageKey {
 #[derive(Clone)]
 pub struct CachedPage {
     pub scale: f32,
+    pub colors: PageColors,
     pub image: Arc<Image>,
     bytes: usize,
 }
 
 impl CachedPage {
     /// `width` and `height` are the size of the rendered image, in pixels.
-    pub fn new(scale: f32, image: Arc<Image>, width: f32, height: f32) -> Self {
+    pub fn new(scale: f32, colors: PageColors, image: Arc<Image>, width: f32, height: f32) -> Self {
         let bytes = (width.max(0.0).ceil() as usize) * (height.max(0.0).ceil() as usize) * 4;
         Self {
             scale,
+            colors,
             image,
             bytes,
         }
@@ -150,7 +154,13 @@ mod tests {
     /// A page whose decoded image takes `megabytes` MB.
     fn page(megabytes: usize) -> CachedPage {
         let image = Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new()));
-        CachedPage::new(1.0, image, 1024.0, (megabytes * 256) as f32)
+        CachedPage::new(
+            1.0,
+            PageColors::PAPER,
+            image,
+            1024.0,
+            (megabytes * 256) as f32,
+        )
     }
 
     #[test]

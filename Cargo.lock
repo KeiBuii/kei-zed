@@ -5236,6 +5236,7 @@ dependencies = [
  "editor",
  "file_icons",
  "gpui",
+ "image",
  "log",
  "project",
  "rdocx",

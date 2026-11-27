@@ -25,7 +25,7 @@ use workspace::{
     item::{Item, ItemBufferKind, ItemEvent, ProjectItem, SerializableItem, TabContentParams},
 };
 
-pub use crate::document::{PageSize, WordDocument};
+pub use crate::document::{PageColors, PageSize, WordDocument};
 
 actions!(
     document_viewer,
@@ -90,7 +90,7 @@ pub struct DocumentView {
     shown_document: Option<Arc<WordDocument>>,
     list_state: ListState,
     zoom: f32,
-    pending_renders: HashMap<usize, (f32, Task<()>)>,
+    pending_renders: HashMap<usize, (f32, PageColors, Task<()>)>,
     failed_pages: HashSet<usize>,
     current_page: usize,
     _subscriptions: Vec<Subscription>,
@@ -258,14 +258,17 @@ impl DocumentView {
         page_index: usize,
         page: PageSize,
         scale: f32,
-        rendered_scale: Option<f32>,
+        colors: PageColors,
+        rendered: Option<&CachedPage>,
         cx: &mut Context<Self>,
     ) {
-        let is_up_to_date = rendered_scale == Some(scale);
-        let is_pending = self
-            .pending_renders
-            .get(&page_index)
-            .is_some_and(|(pending_scale, _)| *pending_scale == scale);
+        let is_up_to_date =
+            rendered.is_some_and(|rendered| rendered.scale == scale && rendered.colors == colors);
+        let is_pending = self.pending_renders.get(&page_index).is_some_and(
+            |(pending_scale, pending_colors, _)| {
+                *pending_scale == scale && *pending_colors == colors
+            },
+        );
         if is_up_to_date || is_pending || self.failed_pages.contains(&page_index) {
             return;
         }
@@ -275,15 +278,20 @@ impl DocumentView {
 
         let task = cx.spawn(async move |this, cx| {
             let png = cx
-                .background_spawn(async move { document.render_page(page_index, scale) })
+                .background_spawn(async move { document.render_page(page_index, scale, colors) })
                 .await;
             this.update(cx, |this, cx| {
                 this.pending_renders.remove(&page_index);
                 match png {
                     Ok(png) => {
                         let image = Arc::new(Image::from_bytes(ImageFormat::Png, png));
-                        let page =
-                            CachedPage::new(scale, image, page.width * scale, page.height * scale);
+                        let page = CachedPage::new(
+                            scale,
+                            colors,
+                            image,
+                            page.width * scale,
+                            page.height * scale,
+                        );
                         let removed = cx
                             .default_global::<PageCache>()
                             .insert(this.page_key(page_index), page);
@@ -298,7 +306,8 @@ impl DocumentView {
             })
             .log_err();
         });
-        self.pending_renders.insert(page_index, (scale, task));
+        self.pending_renders
+            .insert(page_index, (scale, colors, task));
     }
 
     fn render_page(
@@ -319,11 +328,11 @@ impl DocumentView {
         let rendered = cx
             .default_global::<PageCache>()
             .use_page(self.page_key(page_index));
-        let rendered_scale = rendered.as_ref().map(|rendered| rendered.scale);
-        self.request_page_render(page_index, page, scale, rendered_scale, cx);
+        let colors = page_colors(cx);
+        self.request_page_render(page_index, page, scale, colors, rendered.as_ref(), cx);
 
-        // While a page renders at a new zoom level, the previous render is stretched to fit, so
-        // zooming does not flash blank pages.
+        // While a page renders at a new zoom level or in new theme colors, the previous render is
+        // shown stretched to fit, so zooming and switching themes do not flash blank pages.
         let content = if let Some(rendered) = rendered {
             img(rendered.image).size_full().into_any_element()
         } else if self.failed_pages.contains(&page_index) {
@@ -350,7 +359,9 @@ impl DocumentView {
                     .flex_none()
                     .w(px(page_width))
                     .h(px(page_height))
-                    .bg(gpui::white())
+                    .bg(cx.theme().colors().editor_background)
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
                     .shadow_md()
                     .child(content),
             )
@@ -440,6 +451,19 @@ impl DocumentView {
                         this.fit_width(&FitWidth, window, cx);
                     })),
             )
+    }
+}
+
+/// Pages are shown in the editor's colors, so that they follow the theme.
+fn page_colors(cx: &App) -> PageColors {
+    let rgb = |color: gpui::Hsla| {
+        let color = color.to_rgb();
+        [color.r, color.g, color.b]
+    };
+    let colors = cx.theme().colors();
+    PageColors {
+        background: rgb(colors.editor_background),
+        text: rgb(colors.text),
     }
 }
 
